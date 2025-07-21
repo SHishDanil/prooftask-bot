@@ -1,45 +1,40 @@
 import os
-import stripe
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler
 
-# --- Настройка ключей ---
-TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
+# 1. Получаем токен из настроек Render (Settings → Environment → TELEGRAM_TOKEN)
+TOKEN = os.environ['TELEGRAM_TOKEN']
 
-STRIPE_KEY = os.environ.get("STRIPE_KEY", "")
-stripe.api_key = STRIPE_KEY
-
-# --- Инициализация бота и Flask ---
+# 2. Создаём объекты бота и диспетчера
 bot = Bot(token=TOKEN)
-app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, use_context=True)
+dp = Dispatcher(bot, None, workers=0, use_context=True)
 
-# --- Обработчики команд ---
+# 3. Обработчик команды /start
 def start(update, context):
-    context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="Привет! Бот запущен и готов к работе ✅"
-    )
+    update.message.reply_text("Привет! Я работаю на Render 👍")
 
-dispatcher.add_handler(CommandHandler("start", start))
+dp.add_handler(CommandHandler("start", start))
 
-# --- HTTP‑маршруты ---
-@app.route("/", methods=["GET"])
-def index():
-    return "✅ Сервис работает!", 200
+# 4. Flask‑приложение
+app = Flask(__name__)
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    """Обработка входящего update от Telegram"""
+    """Telegram пришлёт сюда JSON‑апдейт — разбираем и обрабатываем."""
     data = request.get_json(force=True)
     update = Update.de_json(data, bot)
-    dispatcher.process_update(update)
-    return "OK", 200
+    dp.process_update(update)
+    return "OK"
 
-# --- Запуск приложения ---
 if __name__ == "__main__":
+    # 5. Регистрируем вебхук у Telegram — на ваш реальный домен
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not host:
+        raise RuntimeError("RENDER_EXTERNAL_HOSTNAME не задан")
+    webhook_url = f"https://{host}/webhook/{TOKEN}"
+    bot.set_webhook(webhook_url)
+
+    # 6. Запускаем сервер на порту из окружения (или 5000)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
