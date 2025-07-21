@@ -1,23 +1,21 @@
-# Dockerfile
-
-# 1) Берём официальный образ с Python 3.12 (там точно есть модуль imghdr)
+# Используем официальный образ Python 3.12 (включает imghdr и всё stdlib)
 FROM python:3.12-slim
 
-# 2) Рабочая директория внутри контейнера
+# Рабочая директория внутри контейнера
 WORKDIR /app
 
-# 3) Копируем только зависимости, чтобы Docker‑кэш их перезатягивал лишь при изменении
-COPY requirements.txt runtime.txt ./
+# Сначала скопируем только список зависимостей,
+# чтобы Docker‑кеш держал вёрстку слоёв
+COPY requirements.txt .
 
-# 4) Обновляем pip и ставим все зависимости
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+# Устанавливаем зависимости
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 5) Копируем остальной код приложения
+# Копируем весь ваш код
 COPY . .
 
-# 6) Открываем порт (на котором Flask принимает webhook; по умолчанию 5000)
-EXPOSE 5000
+# Порт, на котором Render ждёт HTTP‑сервис
+ENV PORT=5000
 
-# 7) Команда запуска вашего бота
+# Запускаем бота
 CMD ["python", "bot.py"]
