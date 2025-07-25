@@ -1,101 +1,121 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-import json
-from threading import Thread
-
+import uuid
 import stripe
-from flask import Flask, request, jsonify
-
+from threading import Thread
+from flask import Flask, request, abort
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ═══════════════════════════════
-#  Настройка ключей из окружения
-# ═══════════════════════════════
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
-# секрет вебхука Stripe (см. Dashboard → Webhooks)
-endpoint_secret = os.environ.get("STRIPE_ENDPOINT_SECRET")
+# === Конфиг: читаем из переменных окружения ===
+TELEGRAM_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
+stripe.api_key         = os.environ["STRIPE_SECRET"]
+STRIPE_WEBHOOK_SECRET  = os.environ["STRIPE_WEBHOOK_SECRET"]
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# Простая in‑memory «БД» задач
+TASKS = {}  # task_id → {"pi_id":..., "status":...}
 
-# ═══════════════════════════════
-#  Flask‑сервер для Stripe вебхуков
-# ═══════════════════════════════
+# === Flask для Stripe webhook ===
 app = Flask(__name__)
 
 @app.route("/webhook", methods=["POST"])
 def stripe_webhook():
-    payload = request.data
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
     try:
-        event = json.loads(payload)
-    except json.JSONDecodeError as e:
-        print("❌ Webhook parse error:", e)
-        return jsonify(success=False), 400
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        print("Webhook signature failed:", e)
+        return abort(400)
 
-    if endpoint_secret:
-        sig_header = request.headers.get("stripe-signature", "")
-        try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, endpoint_secret
-            )
-        except stripe.error.SignatureVerificationError as e:
-            print("❌ Signature verification failed:", e)
-            return jsonify(success=False), 400
-
-    # Обрабатываем события
     etype = event["type"]
-    data = event["data"]["object"]
-    if etype == "payment_intent.succeeded":
-        print(f"🔔 PaymentIntent succeeded: {data['id']} amount={data['amount']}")
-        # тут можно связать с вашим TASKS и слать уведомления в телеграм
-    elif etype == "payment_method.attached":
-        print(f"🔔 PaymentMethod attached: {data['id']}")
-    else:
-        print("🔔 Unhandled event:", etype)
+    obj   = event["data"]["object"]
+    print("▶️ STRIPE EVENT", etype, obj.get("id"))
 
-    return jsonify(success=True)
+    # Отмечаем статус в памяти
+    if etype == "payment_intent.amount_capturable_updated":
+        for t in TASKS.values():
+            if t["pi_id"] == obj["id"]:
+                t["status"] = "authorized"
+    elif etype == "payment_intent.succeeded":
+        for t in TASKS.values():
+            if t["pi_id"] == obj["id"]:
+                t["status"] = "released"
 
+    return ("", 200)
 
-# ═══════════════════════════════
-#  Логика телеграм‑бота
-# ═══════════════════════════════
-TASKS = {}  # простой in‑memory словарь: {task_id: {"pi_id": ..., "status": ...}}
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
+# === Telegram‑бот ===
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Команды:\n"
-        "/task <usd> <описание> — создать задачу и холд\n"
-        "/status <task_id> — проверить статус платежа\n"
-        "/release <task_id> — захватить средства"
+        "/task <usd> <описание>  — создать задачу (будет холд)\n"
+        "/status <task_id>       — проверить статус\n"
+        "/release <task_id>      — захватить средства"
     )
 
 async def cmd_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2:
-        return await update.message.reply_text(
-            "Использование: /task <usd> <описание>"
-        )
+        return await update.message.reply_text("Использование: /task 5 Лого")
     try:
-        amount_usd = float(ctx.args[0])
+        amount = int(ctx.args[0])
     except ValueError:
-        return await update.message.reply_text("Первый аргумент должен быть числом (USD).")
-    description = " ".join(ctx.args[1:])
+        return await update.message.reply_text("Сумма должна быть целым числом")
+    desc = " ".join(ctx.args[1:])
+    task_id = uuid.uuid4().hex[:8]
 
-    # создаём PaymentIntent с ручным захватом
     pi = stripe.PaymentIntent.create(
-        amount=int(amount_usd * 100),
+        amount=amount * 100,
         currency="usd",
-        payment_method_types=["card"],
         capture_method="manual",
-        description=description,
+        payment_method_types=["card"],
+        metadata={"task_id": task_id},
+        description=desc,
     )
-    task_id = str(len(TASKS) + 1)
-    TASKS[task_id] = {"pi_id": pi.id, "status": "new"}
 
+    TASKS[task_id] = {"pi_id": pi.id, "status": "new"}
     await update.message.reply_text(
-        f"✅ Задача {task
+        f"✅ Задача `{task_id}` создана. PI `{pi.id}` (manual hold).\n"
+        "Оплатите в Dashboard (Test mode, карта 4242…), дождитесь `authorized`, затем пришлите:\n"
+        f"/release {task_id}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Использование: /status <task_id>")
+    t = TASKS.get(ctx.args[0])
+    await update.message.reply_text(str(t or "Задача не найдена"))
+
+async def cmd_release(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Использование: /release <task_id>")
+    t = TASKS.get(ctx.args[0])
+    if not t:
+        return await update.message.reply_text("Задача не найдена")
+    stripe.PaymentIntent.capture(t["pi_id"])
+    await update.message.reply_text("✅ Capture отправлен. Ждём succeeded")
+
+def run_bot():
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("task",    cmd_task))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("release", cmd_release))
+    app.run_polling(drop_pending_updates=True)
+
+# === Entry point ===
+if __name__ == "__main__":
+    # 1) Запускаем Flask для Stripe в фоне
+    Thread(target=run_flask, daemon=True).start()
+    # 2) Запускаем Telegram‑бота
+    run_bot()
