@@ -1,172 +1,194 @@
 import os
-import uuid
+import json
 import logging
-from decimal import Decimal
+import secrets
 from threading import Thread
 
+from flask import Flask, request, jsonify
 import requests
 import stripe
-from flask import Flask
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ---------- Конфиг (ENV) ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-STRIPE_SECRET_KEY  = os.getenv("STRIPE_SECRET_KEY", "").strip()   # sk_test_...
-# Webhook секрет опционален (в этом сценарии не обязателен)
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("prooftask-bot")
+
+# ---------- Конфиг из ENV ----------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+STRIPE_SECRET = os.environ.get("STRIPE_SECRET", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
-if not STRIPE_SECRET_KEY:
-    raise SystemExit("STRIPE_SECRET_KEY is not set")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+if not STRIPE_SECRET:
+    raise RuntimeError("STRIPE_SECRET is not set")
 
-stripe.api_key = STRIPE_SECRET_KEY
+stripe.api_key = STRIPE_SECRET
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("prooftask")
+# Память задач на время жизни процесса
+TASK_TO_PI: dict[str, str] = {}
 
-# ---------- Flask: health ----------
+# ---------- Flask ----------
 app = Flask(__name__)
 
 @app.get("/")
 def health():
-    return "OK", 200
+    return "ok", 200
+
+@app.post("/webhook/stripe")
+def stripe_webhook():
+    # В тесте этот вебхук не обязателен, но пусть будет.
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+        else:
+            event = json.loads(payload)
+    except Exception as e:
+        log.exception("webhook error: %s", e)
+        return "bad", 400
+
+    t = event.get("type")
+    if t in ("payment_intent.succeeded", "payment_intent.amount_capturable_updated"):
+        pi = event["data"]["object"]
+        task_id = (pi.get("metadata") or {}).get("task_id")
+        if task_id:
+            TASK_TO_PI[task_id] = pi["id"]
+        log.info("Stripe event: %s for %s", t, pi.get("id"))
+    return "ok", 200
 
 def run_flask():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=10000)
 
-# ---------- Вспомогательное ----------
-def find_pi_by_task_id(task_id: str):
-    """Ищем PaymentIntent по metadata.task_id напрямую в Stripe (не зависит от перезапуска)."""
-    res = stripe.PaymentIntent.search(
-        query=f"metadata['task_id']:'{task_id}'",
-        limit=1
+# ---------- Stripe helpers ----------
+def create_payment_intent(amount_cents: int, description: str, task_id: str):
+    """
+    Создаём PaymentIntent без редиректных методов, с ручным захватом.
+    """
+    pi = stripe.PaymentIntent.create(
+        amount=amount_cents,
+        currency="usd",
+        capture_method="manual",
+        description=description,
+        metadata={"task_id": task_id},
+        # Критично: запретить redirect‑методы, чтобы не требовался return_url
+        automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
     )
-    items = list(res.auto_paging_iter()) if hasattr(res, "auto_paging_iter") else res.data
-    if not items:
-        raise ValueError("PaymentIntent not found for task_id")
-    return items[0]
+    return pi
 
-# ---------- Telegram-команды ----------
+def get_pi_by_task(task_id: str):
+    """
+    Возвращает PaymentIntent по task_id. Сначала локальный кэш, потом Stripe Search.
+    """
+    pi_id = TASK_TO_PI.get(task_id)
+    if pi_id:
+        try:
+            return stripe.PaymentIntent.retrieve(pi_id)
+        except Exception:
+            pass
+    # fallback через Search API
+    try:
+        res = stripe.PaymentIntent.search(query=f"metadata['task_id']:'{task_id}'", limit=1)
+        if res and res.data:
+            TASK_TO_PI[task_id] = res.data[0].id
+            return res.data[0]
+    except Exception:
+        pass
+    return None
+
+def delete_telegram_webhook_sync():
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=8)
+    except Exception:
+        pass
+
+# ---------- Telegram commands ----------
 HELP_TEXT = (
     "Команды:\n"
-    "/task <usd> <описание> — создать платёж с холдом (авто-авторизация)\n"
-    "/status <task_id>      — проверить статус\n"
-    "/release <task_id>     — захватить средства"
+    "/task <сумма_в_$> <описание> — создать задачу (пример: /task 1 Test)\n"
+    "/status <task_id> — статус платежа\n"
+    "/release <task_id> — захватить (capture), когда в Stripe статус authorized\n"
 )
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я живой.\n\n" + HELP_TEXT)
+    await update.message.reply_text("Привет! Это тест-бот оплаты через Stripe.\n" + HELP_TEXT)
 
 async def cmd_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Использование: /task <usd> <описание>")
-
-    # 1) сумма
     try:
-        amount_usd = Decimal(ctx.args[0])
+        args = update.message.text.split(maxsplit=2)
+        amount_usd = int(args[1]) if len(args) > 1 else 1
+        description = args[2] if len(args) > 2 else "Test"
     except Exception:
-        return await update.message.reply_text("Первый аргумент — сумма в USD. Пример: /task 1 Test")
+        return await update.message.reply_text("Формат: /task 1 Test")
 
-    # 2) описание
-    description = " ".join(ctx.args[1:]).strip() or "ProofTask escrow"
-    amount_cents = int(amount_usd * 100)
-
-    # 3) task_id
-    task_id = uuid.uuid4().hex[:8]
-
-    # 4) Создаём PaymentIntent с manual capture и СРАЗУ подтверждаем тестовой картой
+    task_id = secrets.token_hex(4)
+    amount_cents = amount_usd * 100
     try:
-        pi = stripe.PaymentIntent.create(
-            amount=amount_cents,
-            currency="usd",
-            capture_method="manual",        # холд
-            confirm=True,                   # сразу подтверждаем
-            payment_method="pm_card_visa",  # тестовая карта (4242)
-            description=description,
-            metadata={"task_id": task_id},
+        pi = create_payment_intent(amount_cents, description, task_id)
+        TASK_TO_PI[task_id] = pi.id
+        text = (
+            f"✅ Задача {task_id} создана. PI {pi.id} (manual hold).\n\n"
+            f"1) В Stripe Dashboard (Test Mode) откройте платёж и добавьте карту 4242… (или через Shell командой ниже).\n"
+            f"2) Дождитесь статуса authorized / uncaptured.\n"
+            f"3) Пришлите: /release {task_id}\n\n"
+            f"Shell для привязки карты:\n"
+            f"stripe payment_intents confirm {pi.id} --payment_method pm_card_visa"
         )
+        await update.message.reply_text(text)
     except Exception as e:
-        log.exception("PI create failed")
-        return await update.message.reply_text(f"Ошибка создания платежа: {e}")
-
-    text = (
-        f"✅ Задача `{task_id}` создана. "
-        f"PI `{pi['id']}` (hold authorized).\n\n"
-        f"Проверка: /status {task_id}\n"
-        f"Захват: /release {task_id}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+        log.exception("create PI failed")
+        await update.message.reply_text(f"Ошибка создания платежа: {e}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Использование: /status <task_id>")
-    task_id = ctx.args[0].strip()
-
-    try:
-        pi = find_pi_by_task_id(task_id)
-    except Exception as e:
-        return await update.message.reply_text(f"Не найдено: {e}")
-
-    status = pi.get("status")
-    capturable = pi.get("amount_capturable", 0)
-    received = pi.get("amount_received", 0)
-
-    human = status
-    if status != "succeeded" and capturable > 0:
-        human = "authorized (requires_capture)"
-    if status == "succeeded":
-        human = "succeeded (captured)"
-
-    await update.message.reply_text(
-        f"Task: {task_id}\n"
-        f"PI: {pi['id']}\n"
-        f"Status: {human}\n"
-        f"Capturable: {capturable}¢, Received: {received}¢"
-    )
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await update.message.reply_text("Формат: /status <task_id>")
+    task_id = parts[1].strip()
+    pi = get_pi_by_task(task_id)
+    if not pi:
+        return await update.message.reply_text("Не найдено")
+    await update.message.reply_text(f"{pi.id}: status={pi.status}, capturable={pi.amount_capturable}")
 
 async def cmd_release(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Использование: /release <task_id>")
-    task_id = ctx.args[0].strip()
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await update.message.reply_text("Формат: /release <task_id>")
+    task_id = parts[1].strip()
+
+    pi = get_pi_by_task(task_id)
+    if not pi:
+        return await update.message.reply_text("Не найдено")
 
     try:
-        pi = find_pi_by_task_id(task_id)
-    except Exception as e:
-        return await update.message.reply_text(f"Не найдено: {e}")
+        # если уже захвачен — просто подтвердим
+        if pi.status in ("succeeded", "processing"):
+            return await update.message.reply_text(f"✅ Уже {pi.status}. PI {pi.id}")
 
-    try:
-        stripe.PaymentIntent.capture(pi["id"])
+        # Authorized (requires_capture) — захватываем
+        if pi.status == "requires_capture":
+            pi = stripe.PaymentIntent.capture(pi.id)
+            return await update.message.reply_text(f"✅ Захвачен. Статус: {pi.status}. PI {pi.id}")
+
+        return await update.message.reply_text(f"Статус {pi.status}. Сначала добавьте карту и авторизуйте платёж.")
     except Exception as e:
         log.exception("capture failed")
         return await update.message.reply_text(f"Ошибка захвата: {e}")
 
-    await update.message.reply_text("✅ Захват отправлен. Через секунду проверьте: /status " + task_id)
-
-def delete_telegram_webhook_sync():
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            timeout=8,
-        )
-    except Exception:
-        pass
-
 def run_bot():
-    # На всякий случай снимем webhook, чтобы polling не конфликтовал
+    # снимаем webhook, чтобы polling не конфликтовал
     delete_telegram_webhook_sync()
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start",   cmd_start))
-    application.add_handler(CommandHandler("task",    cmd_task))
-    application.add_handler(CommandHandler("status",  cmd_status))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("task", cmd_task))
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("release", cmd_release))
     application.run_polling(drop_pending_updates=True)
 
-# ---------- Entry ----------
+# ---------- entry ----------
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     run_bot()
